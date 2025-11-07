@@ -366,10 +366,11 @@ class AsyncvLLMServer(AsyncServerBase):
             return StreamingResponse(content=generator, media_type="text/event-stream")
         else:
             assert isinstance(generator, CompletionResponse)
-            if generator.choices and generator.choices[0].logprobs:
-                generator.choices[0].logprobs.token_logprobs = [] 
-                generator.choices[0].logprobs.top_logprobs = []
-                generator.choices[0].logprobs.text_offset = []
+            # Keep logprobs for IcePop - comment out the clearing
+            # if generator.choices and generator.choices[0].logprobs:
+            #     generator.choices[0].logprobs.token_logprobs = []
+            #     generator.choices[0].logprobs.top_logprobs = []
+            #     generator.choices[0].logprobs.text_offset = []
             return JSONResponse(content=generator.model_dump())
 
     async def generate(

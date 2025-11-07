@@ -187,6 +187,9 @@ class AgentExecutionEngine:
         else:
             self.chat_parser = chat_parser
 
+        # Cache for storing inference log probs per application_id for IcePop
+        self.rollout_log_probs_cache = {}
+
 
     async def get_model_response(self, messages, application_id, **kwargs):
         """
@@ -201,13 +204,15 @@ class AgentExecutionEngine:
             **kwargs: Additional arguments to pass to the model
 
         Returns:
-            The model's response text
+            str: The model's response text (log probs are cached for per-step alignment)
 
         Raises:
             NotImplementedError: If the engine type is not supported
         """
         if self.engine_name == "verl":
-            return await self._get_verl_async(messages, application_id, **kwargs)
+            # _get_verl_async returns response string (log probs are cached internally)
+            response = await self._get_verl_async(messages, application_id, **kwargs)
+            return response
         else:
             raise NotImplementedError(f"Engine type '{self.engine_name}' not supported")
 
@@ -256,6 +261,11 @@ class AgentExecutionEngine:
 
         output = await self.router.generate_sequences(batch, application_id=application_id, **kwargs)
 
+        # Extract inference log probs for IcePop if available
+        rollout_log_probs = None
+        if "rollout_log_probs" in output.batch:
+            rollout_log_probs = output.batch["rollout_log_probs"][0]
+
         attn = output.batch["attention_mask"][0, self.max_prompt_length :]
         tokens = output.batch["responses"][0]
 
@@ -263,15 +273,28 @@ class AgentExecutionEngine:
         non_pad_indices = (attn == 1).nonzero(as_tuple=True)[0]
         if len(non_pad_indices) == 0:
             trimmed = tokens[:0]  # empty
+            trimmed_log_probs = None
         else:
             last_valid_idx = non_pad_indices[-1].item()
             trimmed = tokens[: last_valid_idx + 1]  # include the last valid token
+            # Trim log probs to match trimmed tokens
+            if rollout_log_probs is not None:
+                trimmed_log_probs = rollout_log_probs[: last_valid_idx + 1]
+            else:
+                trimmed_log_probs = None
 
         response = self.tokenizer.decode(trimmed, skip_special_tokens=False)
 
         pad_token = self.tokenizer.pad_token
         eos_token = self.tokenizer.eos_token
         response = response.replace(pad_token, "").replace(eos_token, "")
+
+        # Cache log probs for per-step alignment
+        if trimmed_log_probs is not None:
+            if application_id not in self.rollout_log_probs_cache:
+                self.rollout_log_probs_cache[application_id] = []
+            self.rollout_log_probs_cache[application_id].append(trimmed_log_probs)
+
         return response
 
     async def run_agent_trajectory_async(self, idx, application_id, seed=0, mode="Text", **kwargs):
@@ -374,7 +397,7 @@ class AgentExecutionEngine:
 
             # 获取第一个user消息以及之前的所有内容
             init_messages = []
-            for mes in result_messages:
+            for mes in result_messages:  
                 init_messages.append(mes)
                 if mes["role"] == "user":
                     break
@@ -398,12 +421,46 @@ class AgentExecutionEngine:
 
             response_tokens = []
             response_masks = []
+            response_token_types = []  # Track which tokens are assistant (1) vs environment (0)
+
+            # IcePop: Collect aligned inference log probs per-step
+            aligned_rollout_log_probs_list = []
+
+            # Get cached log probs from vLLM (one per assistant message)
+            cached_log_probs = []
+            if application_id in self.rollout_log_probs_cache:
+                cached_log_probs = self.rollout_log_probs_cache[application_id]
+
+            assistant_msg_idx = 0
+
             for msg in response_messages:
                 if self.chat_parser:
                     if msg["role"] == "assistant":
                         response_token, response_mask = convert_messages_to_tokens_and_masks([msg], tokenizer=self.tokenizer, parser=self.chat_parser, contains_first_msg=False, contains_generation_msg=False)
+                        response_token_types.extend([1] * len(response_token))  # Mark as assistant
+
+                        # IcePop: Align THIS step's vLLM log probs with re-tokenized assistant tokens
+                        if assistant_msg_idx < len(cached_log_probs) and cached_log_probs[assistant_msg_idx] is not None:
+                            step_rollout_log_probs = cached_log_probs[assistant_msg_idx]
+
+                            if len(response_token) != step_rollout_log_probs.shape[0]:
+                                if step_rollout_log_probs.shape[0] > len(response_token):
+                                    aligned_logprobs = step_rollout_log_probs[:len(response_token)]
+                                else:
+                                    padding_size = len(response_token) - step_rollout_log_probs.shape[0]
+                                    aligned_logprobs = torch.nn.functional.pad(
+                                        step_rollout_log_probs, (0, padding_size), value=0.0
+                                    )
+                                aligned_rollout_log_probs_list.append(aligned_logprobs)
+                            else:
+                                aligned_rollout_log_probs_list.append(step_rollout_log_probs)
+                        else:
+                            aligned_rollout_log_probs_list.append(None)
+
+                        assistant_msg_idx += 1
                     else:
                         response_token, response_mask = convert_messages_to_tokens_and_masks([msg], tokenizer=self.tokenizer, parser=self.chat_parser, contains_first_msg=False, contains_generation_msg=True)
+                        response_token_types.extend([0] * len(response_token))  # Mark as environment
                     response_tokens.extend(response_token)
                     response_masks.extend(response_mask)
                 else:
@@ -418,6 +475,7 @@ class AgentExecutionEngine:
                 # Truncate tokens and masks
                 response_tokens = response_tokens[:self.max_response_length]
                 response_masks = response_masks[:self.max_response_length]
+                response_token_types = response_token_types[:self.max_response_length]
                 response_token_len = len(response_tokens)
                 print(f"[TrajectoryLogs] Response length truncated from {original_len} to {response_token_len}")
 
@@ -448,6 +506,25 @@ class AgentExecutionEngine:
                 if masked_out:
                     print(f"[TrajectoryLogs] Trajectory is masked out due to overlong filter.")
 
+            # Extract and process ALIGNED inference log probs for IcePop
+            traj_rollout_log_probs = None
+            if aligned_rollout_log_probs_list and any(x is not None for x in aligned_rollout_log_probs_list):
+                valid_logprobs = [lp for lp in aligned_rollout_log_probs_list if lp is not None]
+                if valid_logprobs:
+                    vllm_rollout_log_probs = torch.cat(valid_logprobs, dim=0)
+                    padded_rollout_log_probs = torch.zeros(len(response_tokens), dtype=torch.float32)
+                    assistant_positions = [i for i, t in enumerate(response_token_types) if t == 1]
+
+                    num_to_fill = min(len(assistant_positions), vllm_rollout_log_probs.shape[0])
+                    for i in range(num_to_fill):
+                        padded_rollout_log_probs[assistant_positions[i]] = vllm_rollout_log_probs[i]
+
+                    traj_rollout_log_probs = padded_rollout_log_probs
+
+            # Clean up cache (early cleanup for memory efficiency)
+            if application_id in self.rollout_log_probs_cache:
+                del self.rollout_log_probs_cache[application_id]
+
             token_result = {
                 "prompt_tokens": torch.tensor(prompt_tokens, dtype=torch.long),
                 "response_tokens": torch.tensor(response_tokens, dtype=torch.long),
@@ -458,6 +535,7 @@ class AgentExecutionEngine:
                 "chat_completions": result_messages,
                 "termination_reason": termination_reason,
                 "masked_out": float(masked_out),
+                "rollout_log_probs": traj_rollout_log_probs,
                 "metrics": {
                     # Total number of steps taken in the trajectory
                     "steps": len(trajectory_result.steps)//2 if hasattr(trajectory_result, 'steps') else 0,
@@ -476,6 +554,10 @@ class AgentExecutionEngine:
             raise Exception(f"error msg is {e}, corresponding traceback code is : {stack_trace}")
             
         finally:
+            # Ensure cache cleanup even on exceptions (safety net for memory leak prevention)
+            if application_id in self.rollout_log_probs_cache:
+                del self.rollout_log_probs_cache[application_id]
+
             # Always kill pod when trajectory completes or fails
             pod_manager = self.pod_managers[idx] if hasattr(self, 'pod_managers') and idx < len(self.pod_managers) else None
             if pod_name and pod_manager:
@@ -513,17 +595,21 @@ class AgentExecutionEngine:
         """
         for ind in range(self.retry_limit):
             try:
+                # Clear stale cache before retry to prevent cache pollution (defense-in-depth)
+                if ind > 0 and application_id in self.rollout_log_probs_cache:
+                    del self.rollout_log_probs_cache[application_id]
+
                 return await asyncio.wait_for(self.run_agent_trajectory_async(idx, application_id=application_id, seed=seed, mode=mode, **kwargs), timeout=7200)
             except Exception as e:
                 stack_trace = traceback.format_exc()
                 print(f"[TrainingLogs] func run_agent_trajectory_with_retry, generate trajectory error, error msg is {e}, response params is idx: {idx}, application_id: {application_id}, mode: {mode}, kwargs: {kwargs}, corresponding traceback code is : {stack_trace}, retry is {ind}/{self.retry_limit}")
                 traceback.print_exc()
-                
+
                 # Reset pod for retry if PodManager is available and this is not the last attempt
                 pod_manager = self.pod_managers[idx] if hasattr(self, 'pod_managers') and idx < len(self.pod_managers) else None
                 if pod_manager and ind < self.retry_limit - 1:
                     await self._reset_pod_for_retry(idx, pod_manager)
-                
+
                 continue
         traceback.print_exc()
         raise Exception(f"Trajectory {idx} cannot complete. Please check the log message")

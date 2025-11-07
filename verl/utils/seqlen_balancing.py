@@ -16,6 +16,7 @@ import copy
 import heapq
 from itertools import chain
 
+import numpy as np
 import torch
 from torch import distributed as dist
 
@@ -260,7 +261,7 @@ def rearrange_micro_batches(
     Split a batch into micro-batches by total token count, with optional DP sync and padding.
 
     Args:
-        batch (TensorDict): must include "attention_mask" (B*S); other fields are sliced similarly.
+        batch (TensorDict or DataProto): must include "attention_mask" (B*S); other fields are sliced similarly.
         max_token_len (int): max sum of attention_mask per micro-batch.
         dp_group (optional): torch.distributed group for data-parallel sync.
         num_batches_divided_by (optional): virtual pipeline parallel size, for megatron.
@@ -269,15 +270,26 @@ def rearrange_micro_batches(
         use_dynamic_bsz_balance (bool, optional): balance the computational workload between micro-batches
 
     Returns:
-        List[TensorDict]: the micro-batches.
+        List[TensorDict or DataProto]: the micro-batches (same type as input).
         List[List[int]]: index lists mapping each micro-batch back to original positions.
     """
+    # Handle both dict and DataProto input
+    from verl import DataProto
+    is_dataproto = isinstance(batch, DataProto)
+
+    if is_dataproto:
+        batch_dict = batch.batch
+        non_tensor_batch = batch.non_tensor_batch if hasattr(batch, 'non_tensor_batch') else {}
+    else:
+        batch_dict = batch
+        non_tensor_batch = {}
+
     # this is per local micro_bsz
-    max_seq_len = batch["attention_mask"].shape[-1]
+    max_seq_len = batch_dict["attention_mask"].shape[-1]
     assert max_token_len >= max_seq_len, (
         f"max_token_len must be greater than the sequence length. Got {max_token_len=} and {max_seq_len=}"
     )
-    seq_len_effective: torch.Tensor = batch["attention_mask"].sum(dim=1)
+    seq_len_effective: torch.Tensor = batch_dict["attention_mask"].sum(dim=1)
     total_seqlen = seq_len_effective.sum().item()
     # NOTE: num_microbatches <= batch_size, so take the min of this two.
     num_micro_batches = min(len(seq_len_effective), ceildiv(total_seqlen, max_token_len))
@@ -309,12 +321,28 @@ def rearrange_micro_batches(
     micro_batches = []
 
     for partition in micro_bsz_idx:
+        # Slice tensor batch
         curr_micro_batch = []
         for idx in partition:
-            curr_micro_batch.append(batch[idx : idx + 1])
-        curr_micro_batch = torch.cat(curr_micro_batch)
+            curr_micro_batch.append(batch_dict[idx : idx + 1])
+        curr_micro_batch_tensor = torch.cat(curr_micro_batch)
 
-        micro_batches.append(curr_micro_batch)
+        # If DataProto, also slice non_tensor_batch and reconstruct
+        if is_dataproto:
+            micro_non_tensor = {}
+            for key, value in non_tensor_batch.items():
+                # Slice non-tensor data according to partition indices
+                if isinstance(value, (list, tuple)):
+                    micro_non_tensor[key] = [value[idx] for idx in partition]
+                elif isinstance(value, np.ndarray):
+                    micro_non_tensor[key] = value[partition]
+                else:
+                    # For other types, just copy the reference
+                    micro_non_tensor[key] = value
+
+            micro_batches.append(DataProto(batch=curr_micro_batch_tensor, non_tensor_batch=micro_non_tensor))
+        else:
+            micro_batches.append(curr_micro_batch_tensor)
 
     return micro_batches, micro_bsz_idx
 

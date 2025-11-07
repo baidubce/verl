@@ -328,7 +328,27 @@ class Router:
         end_time = time.time()
         print(f"[TrainingLogsRouter] current idx is {idx}, current application id is {application_id}, request address is {address}, model is {self.model_name}, kwargs is {kwargs}, cost time {end_time - start_time}")
 
-        return await self.postprocess_batch(batch, batch_response_ids, kwargs["n"])
+        # Extract rollout log probs if calculate_log_probs is enabled
+        batch_rollout_log_probs = None
+        if self.config.actor_rollout_ref.rollout.calculate_log_probs:
+            batch_rollout_log_probs = []
+            for batch_index, completions in enumerate(completions_list):
+                rollout_log_probs = []
+                for choice in completions.get("choices", []):
+                    logprobs_data = choice.get("logprobs", {})
+                    token_logprobs = logprobs_data.get("token_logprobs", [])
+                    tokens = logprobs_data.get("tokens", [])
+
+                    # vLLM returns prompt+response logprobs, slice to get response only
+                    if tokens and token_logprobs:
+                        response_length = len(tokens)
+                        response_logprobs = token_logprobs[-response_length:] if len(token_logprobs) >= response_length else token_logprobs
+                        rollout_log_probs.append(response_logprobs)
+                    else:
+                        rollout_log_probs.append(token_logprobs)
+                batch_rollout_log_probs.append(rollout_log_probs)
+
+        return await self.postprocess_batch(batch, batch_response_ids, kwargs["n"], batch_rollout_log_probs)
 
     async def submit_completions(self, address, model, prompt, **kwargs):
         """
@@ -342,7 +362,7 @@ class Router:
         # Potential blocking: network I/O can block
         return await poll_completions_openai(address=address, model=model, prompt=prompt, **kwargs)
 
-    async def postprocess_batch(self, batch: DataProto, response_ids: list[list[int]], n: int) -> DataProto:
+    async def postprocess_batch(self, batch: DataProto, response_ids: list[list[int]], n: int, rollout_log_probs: list[list[list[float]]] = None) -> DataProto:
         """
         Postprocess the batch of responses from the model server.
         
@@ -397,6 +417,23 @@ class Router:
         response_attention_mask = get_response_mask(response_id=response_tensor, eos_token=self.eos_token_id, dtype=attention_mask.dtype)
         attention_mask = torch.cat((attention_mask, response_attention_mask), dim=-1)
 
+        # Process rollout log probs if provided
+        rollout_log_probs_tensor = None
+        if rollout_log_probs is not None:
+            # Flatten rollout_log_probs similar to response_ids
+            flat_rollout_log_probs = []
+            for rollout_log_probs_per_prompt in rollout_log_probs:
+                if rollout_log_probs_per_prompt is not None:
+                    for rollout_log_prob in rollout_log_probs_per_prompt:
+                        flat_rollout_log_probs.append(rollout_log_prob)
+
+            # Pad to same length as response_tensor
+            rollout_log_probs_tensor = pad_2d_list_to_length(
+                flat_rollout_log_probs,
+                0.0,  # Pad with 0.0 for log probs
+                max_length=self.config.actor_rollout_ref.rollout.response_length
+            ).to(idx.device)
+
         output = TensorDict(
             {
                 "prompts": idx,
@@ -407,4 +444,9 @@ class Router:
             },
             batch_size=batch_size,
         )
+
+        # Add rollout log probs if available
+        if rollout_log_probs_tensor is not None:
+            output["rollout_log_probs"] = rollout_log_probs_tensor
+
         return DataProto(batch=output, meta_info=batch.meta_info)

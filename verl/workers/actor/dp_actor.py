@@ -19,6 +19,7 @@ Single Process Actor
 
 import logging
 import os
+import numpy as np
 
 import torch
 from torch import nn
@@ -86,6 +87,100 @@ class DataParallelPPOActor(BasePPOActor):
             else entropy_from_logits
         )
         self.device_name = get_device_name()
+
+    def _compute_icepop_mask(self, rollout_log_probs, old_log_probs, response_mask, alpha=0.5, beta=2.0):
+        """
+        Compute IcePop double-sided masking to filter out noisy gradient updates.
+
+        The masking function M(k) where k = p_train / p_rollout:
+        M(k) = { k  if k ∈ [α, β]
+               { 0  otherwise
+
+        Args:
+            rollout_log_probs: Log probabilities from rollout/inference engine (vLLM), shape [batch_size, response_length]
+            old_log_probs: Log probabilities from training engine (FSDP old policy), shape [batch_size, response_length]
+            response_mask: Mask for valid (non-padding) tokens, shape [batch_size, response_length]
+            alpha: Lower bound for probability ratio (default: 0.5)
+            beta: Upper bound for probability ratio (default: 2.0)
+
+        Returns:
+            icepop_mask: Binary mask tensor, 1.0 for healthy updates, 0.0 for clipped tokens
+            clipping_stats: Dictionary with clipping statistics for logging
+        """
+        with torch.no_grad():
+            # Initialize icepop_mask with ones (all tokens valid by default)
+            icepop_mask = torch.ones_like(response_mask, dtype=torch.float32)
+
+            # Only compute probability ratios for valid (non-padding) tokens
+            valid_mask = response_mask > 0
+
+            if valid_mask.sum() == 0:
+                # No valid tokens, return all-ones mask
+                clipping_stats = {
+                    'icepop/clipping_ratio': 0.0,
+                    'icepop/clipped_tokens': 0,
+                    'icepop/total_tokens': 0,  # Only valid (non-padding) tokens
+                    'icepop/clipped_lower': 0,
+                    'icepop/clipped_upper': 0,
+                    'icepop/valid_ratio_mean': 0.0,
+                    'icepop/clipped_ratio_mean': 0.0,
+                    'icepop/prob_ratio_mean': 0.0,
+                    'icepop/prob_ratio_std': 0.0,
+                    'icepop/prob_ratio_min': 0.0,
+                    'icepop/prob_ratio_max': 0.0,
+                }
+                return icepop_mask, clipping_stats
+
+            # Extract only valid tokens for probability ratio computation
+            rollout_log_probs_valid = rollout_log_probs[valid_mask]
+            old_log_probs_valid = old_log_probs[valid_mask]
+
+            # Convert log probabilities to probabilities (only for valid tokens)
+            # p_train (old_log_probs) / p_rollout (rollout_log_probs) = exp(log_p_train - log_p_rollout)
+            log_ratio = old_log_probs_valid - rollout_log_probs_valid
+            prob_ratio = torch.exp(log_ratio)
+
+            # Apply double-sided clipping: keep only ratios in [alpha, beta] for valid tokens
+            # Mask out tokens where:
+            # 1. prob_ratio < alpha (training prob << rollout prob - huge divergence)
+            # 2. prob_ratio > beta (training prob >> rollout prob - overconfident)
+            valid_in_range = ((prob_ratio >= alpha) & (prob_ratio <= beta)).float()
+
+            # Scatter the valid token mask back to the full tensor
+            # Padding tokens keep their value of 1.0 (not clipped)
+            # Valid tokens get their computed mask value
+            icepop_mask[valid_mask] = valid_in_range
+
+            # Compute clipping statistics (only on valid tokens, not padding)
+            total_valid_tokens = prob_ratio.numel()  # Only count valid tokens
+            clipped_valid_tokens = (valid_in_range == 0.0).sum().item()
+            clipping_ratio = clipped_valid_tokens / total_valid_tokens if total_valid_tokens > 0 else 0.0
+
+            # Analyze clipped vs non-clipped tokens (only valid tokens)
+            clipped_lower = (prob_ratio < alpha).sum().item()  # Training prob too low
+            clipped_upper = (prob_ratio > beta).sum().item()   # Training prob too high
+
+            # Calculate mean probability ratios for diagnostics (only on valid tokens)
+            kept_mask = valid_in_range == 1.0
+            clipped_mask = valid_in_range == 0.0
+            valid_ratio_mean = prob_ratio[kept_mask].mean().item() if kept_mask.any() else 0.0
+            clipped_ratio_mean = prob_ratio[clipped_mask].mean().item() if clipped_mask.any() else 0.0
+
+            clipping_stats = {
+                'icepop/clipping_ratio': clipping_ratio,
+                'icepop/clipped_tokens': clipped_valid_tokens,
+                'icepop/total_tokens': total_valid_tokens,  # Only valid (non-padding) tokens
+                'icepop/clipped_lower': clipped_lower,
+                'icepop/clipped_upper': clipped_upper,
+                'icepop/valid_ratio_mean': valid_ratio_mean,
+                'icepop/clipped_ratio_mean': clipped_ratio_mean,
+                'icepop/prob_ratio_mean': prob_ratio.mean().item(),
+                'icepop/prob_ratio_std': prob_ratio.std().item(),
+                'icepop/prob_ratio_min': prob_ratio.min().item(),
+                'icepop/prob_ratio_max': prob_ratio.max().item(),
+            }
+
+        return icepop_mask, clipping_stats
 
     def _forward_micro_batch(
         self, micro_batch, temperature, calculate_entropy=False
@@ -377,22 +472,23 @@ class DataParallelPPOActor(BasePPOActor):
         ]
         if self.config.use_kl_loss:
             select_keys.append("ref_log_prob")
-        if self.config.tis_imp_ratio_cap > 0:
+        # Both TIS and IcePop require rollout_log_probs from inference engine
+        if self.config.tis_imp_ratio_cap > 0 or self.config.enable_icepop:
             assert "rollout_log_probs" in data.batch.keys(), (
-                "Truncated Importance Sampling (TIS) requires to configure "
-                "`actor_rollout_ref.rollout.calculate_log_probs=True` "
-                "and is not currently supported in Server mode (agent loop)."
+                "TIS/IcePop requires `actor_rollout_ref.rollout.calculate_log_probs=True`. "
+                "This works in both standard vLLM rollout and agent-based (server) mode."
             )
             select_keys.append("rollout_log_probs")
             
         if 'traj_mask' in data.batch:
             select_keys.append('traj_mask')
 
-            if 'is_pad_step' in data.non_tensor_batch:
-                is_pad_step = data.non_tensor_batch["is_pad_step"]
-                pad_step_indices = np.where(is_pad_step == True)[0]
-                if len(pad_step_indices) > 0:
-                    data.batch["advantages"][pad_step_indices] = 0
+        # Handle pad steps for agent-based training
+        if 'is_pad_step' in data.non_tensor_batch:
+            is_pad_step = data.non_tensor_batch["is_pad_step"]
+            pad_step_indices = np.where(is_pad_step == True)[0]
+            if len(pad_step_indices) > 0:
+                data.batch["advantages"][pad_step_indices] = 0
 
         has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
         non_tensor_select_keys = ["multi_modal_inputs"] if has_multi_modal_inputs else []
@@ -406,8 +502,8 @@ class DataParallelPPOActor(BasePPOActor):
         on_policy = len(mini_batches) == 1 and self.config.ppo_epochs == 1
 
         metrics = {}
-        
-        for _ in range(self.config.ppo_epochs):
+
+        for epoch_idx in range(self.config.ppo_epochs):
             for batch_idx, mini_batch in enumerate(mini_batches):
                 if self.config.use_dynamic_bsz:
                     max_token_len = self.config.ppo_max_token_len_per_gpu * self.ulysses_sequence_parallel_size
@@ -420,7 +516,7 @@ class DataParallelPPOActor(BasePPOActor):
 
                 self.actor_optimizer.zero_grad()
 
-                for micro_batch in micro_batches:
+                for micro_batch_idx, micro_batch in enumerate(micro_batches):
                     micro_batch = micro_batch.to(get_device_id())
                     micro_batch_metrics = {}
                     model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}
@@ -432,6 +528,28 @@ class DataParallelPPOActor(BasePPOActor):
                     old_log_prob = model_inputs["old_log_probs"]
                     rollout_log_probs = model_inputs["rollout_log_probs"] if self.config.tis_imp_ratio_cap > 0 else None
                     advantages = model_inputs["advantages"]
+
+                    # IcePop+TIS: Apply double-sided masking and truncated importance sampling
+                    icepop_stats = {}
+                    tis_stats = {}
+
+                    # IcePop: Filter noisy gradient updates from training-inference mismatch
+                    # Uses same rollout_log_probs as TIS (unified source)
+                    if self.config.enable_icepop and rollout_log_probs is not None:
+                        # Compute IcePop mask using configurable alpha/beta parameters
+                        # Pass response_mask to exclude padding tokens from IcePop computation
+                        icepop_mask, icepop_stats = self._compute_icepop_mask(
+                            rollout_log_probs=rollout_log_probs,
+                            old_log_probs=old_log_prob,
+                            response_mask=response_mask,
+                            alpha=self.config.icepop_alpha,
+                            beta=self.config.icepop_beta
+                        )
+
+                        # Combine IcePop mask with response_mask (element-wise AND)
+                        # Original response_mask filters padding/invalid tokens
+                        # IcePop mask filters tokens with excessive probability discrepancy
+                        response_mask = response_mask * icepop_mask
 
                     entropy_coeff = self.config.entropy_coeff
                     loss_agg_mode = self.config.loss_agg_mode
@@ -504,10 +622,14 @@ class DataParallelPPOActor(BasePPOActor):
                             "actor/pg_clipfrac_lower": pg_clipfrac_lower.detach().item(),
                         }
                     )
+                    # Add IcePop statistics if masking was applied
+                    if icepop_stats:
+                        micro_batch_metrics.update(icepop_stats)
                     append_to_dict(metrics, micro_batch_metrics)
 
                 grad_norm = self._optimizer_step()
                 mini_batch_metrics = {"actor/grad_norm": grad_norm.detach().item()}
                 append_to_dict(metrics, mini_batch_metrics)
+
         self.actor_optimizer.zero_grad()
         return metrics

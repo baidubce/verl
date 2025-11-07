@@ -72,6 +72,10 @@ class ActorConfig(BaseConfig):
         clip_ratio_c (float): Clipping ratio for critic loss.
         loss_agg_mode (str): Loss aggregation mode. Options: 'token-mean', 'sample-mean'.
         entropy_coeff (float): Entropy coefficient for regularization.
+        tis_imp_ratio_cap (float): Cap for TIS (Truncated Importance Sampling) ratio. Set to -1 to disable.
+        enable_icepop (bool): Whether to enable IcePop double-sided masking to filter noisy gradients.
+        icepop_alpha (float): Lower bound for IcePop probability ratio (p_train/p_rollout). Default: 0.5.
+        icepop_beta (float): Upper bound for IcePop probability ratio (p_train/p_rollout). Default: 2.0.
         use_kl_loss (bool): Whether to use KL divergence loss.
         use_torch_compile (bool): Whether to use torch.compile for optimization.
         kl_loss_coef (float): KL divergence loss coefficient.
@@ -107,6 +111,9 @@ class ActorConfig(BaseConfig):
     loss_agg_mode: str = "token-mean"
     entropy_coeff: float = 0
     tis_imp_ratio_cap: float = -1
+    enable_icepop: bool = False
+    icepop_alpha: float = 0.5
+    icepop_beta: float = 2.0
     use_kl_loss: bool = False
     use_torch_compile: bool = True
     kl_loss_coef: float = 0.001
